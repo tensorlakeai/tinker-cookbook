@@ -55,6 +55,27 @@ def _is_sandbox_terminated(e: BaseException) -> bool:
     return _TERMINATED_RE.search(str(e)) is not None
 
 
+# AsyncSandbox.run() buffers all output on the client before it returns, so cap
+# stdout/stderr inside the sandbox. Each stream goes through ``head -c N``, then
+# ``cat`` discards the rest so the program does not get SIGPIPE. ``stdbuf -o0``
+# stops ``head`` from buffering, so output before a timeout kill is kept.
+# $1 is the command and $2 is the cap. ``wait`` on process-substitution PIDs
+# needs bash 4.4+.
+_CAPPED_RUN_SCRIPT = """\
+n=$2
+cap() {
+  if command -v stdbuf >/dev/null 2>&1; then stdbuf -o0 head -c "$n"; else head -c "$n"; fi
+  cat >/dev/null
+}
+exec 5> >(cap); p1=$!
+exec 6> >(cap >&2); p2=$!
+bash -lc "$1" >&5 2>&6; rc=$?
+exec 5>&- 6>&-
+wait "$p1" "$p2"
+exit "$rc"
+"""
+
+
 def _cap(text: str, max_bytes: int) -> str:
     """Truncate *text* to at most *max_bytes* UTF-8 bytes."""
     data = text.encode()
@@ -162,7 +183,11 @@ class TensorlakeSandbox:
         cap = max_output_bytes if max_output_bytes is not None else self._max_stream_output_bytes
         try:
             result = await self._sandbox.run(
-                "bash", ["-lc", command], working_dir=workdir, timeout=timeout, user=self._user
+                "bash",
+                ["-c", _CAPPED_RUN_SCRIPT, "bash", command, str(cap)],
+                working_dir=workdir,
+                timeout=timeout,
+                user=self._user,
             )
             return SandboxResult(
                 stdout=_cap(result.stdout, cap),
@@ -334,7 +359,42 @@ class TensorlakeSandboxPool:
         self._snapshot_id: str | None = None
         self._setup_lock = asyncio.Lock()
         self._active: set[TensorlakeSandbox] = set()
+        self._creating: set[asyncio.Task[TensorlakeSandbox]] = set()
         self._terminated = False
+
+    def _check_terminated(self) -> None:
+        if self._terminated:
+            raise SandboxError("TensorlakeSandboxPool has been terminated.")
+
+    async def _create_sandbox(self, snapshot_id: str | None = None) -> TensorlakeSandbox:
+        """Create a sandbox and add it to ``_active``.
+
+        ``terminate`` waits for creations in progress, so no sandbox is left
+        running after it returns.
+        """
+        self._check_terminated()
+        task = asyncio.ensure_future(
+            TensorlakeSandbox.create(
+                image=self._image, timeout=self._sandbox_timeout_secs, snapshot_id=snapshot_id
+            )
+        )
+        self._creating.add(task)
+        try:
+            sandbox = await task
+        finally:
+            self._creating.discard(task)
+        if self._terminated:
+            await sandbox.cleanup()
+            self._check_terminated()
+        self._active.add(sandbox)
+        return sandbox
+
+    async def _release(self, sandbox: TensorlakeSandbox) -> None:
+        self._active.discard(sandbox)
+        try:
+            await sandbox.cleanup()
+        except Exception as e:
+            logger.warning(f"Tensorlake sandbox cleanup failed: {e}")
 
     async def _get_snapshot_id(self) -> str | None:
         """Run ``setup_command`` once and snapshot the result."""
@@ -342,18 +402,17 @@ class TensorlakeSandboxPool:
             return None
         async with self._setup_lock:
             if self._snapshot_id is None:
-                template = await TensorlakeSandbox.create(
-                    image=self._image, timeout=self._sandbox_timeout_secs
-                )
+                template = await self._create_sandbox()
                 try:
                     result = await template.run_command(self._setup_command, timeout=600)
+                    self._check_terminated()
                     if result.exit_code != 0:
                         raise SandboxError(
                             f"Tensorlake pool setup failed ({result.exit_code}): {result.stderr}"
                         )
                     self._snapshot_id = await template.checkpoint()
                 finally:
-                    await template.cleanup()
+                    await self._release(template)
             return self._snapshot_id
 
     async def run_in_workdir(
@@ -371,17 +430,10 @@ class TensorlakeSandboxPool:
             command: Command and arguments (e.g., ["python", "run.py"])
             timeout: Execution timeout in seconds
         """
-        if self._terminated:
-            raise SandboxError("TensorlakeSandboxPool has been terminated.")
-
+        self._check_terminated()
         snapshot_id = await self._get_snapshot_id()
         async with self._semaphore:
-            sandbox = await TensorlakeSandbox.create(
-                image=self._image,
-                timeout=self._sandbox_timeout_secs,
-                snapshot_id=snapshot_id,
-            )
-            self._active.add(sandbox)
+            sandbox = await self._create_sandbox(snapshot_id)
             try:
                 workdir = f"/workspace/{uuid.uuid4().hex[:12]}"
                 if files:
@@ -402,15 +454,13 @@ class TensorlakeSandboxPool:
                     timeout=timeout or self._sandbox_timeout_secs,
                 )
             finally:
-                self._active.discard(sandbox)
-                try:
-                    await sandbox.cleanup()
-                except Exception as e:
-                    logger.warning(f"Tensorlake sandbox cleanup failed: {e}")
+                await self._release(sandbox)
 
     async def terminate(self) -> None:
-        """Stop accepting work and terminate all active sandboxes."""
+        """Stop accepting work and terminate all sandboxes, including ones being created."""
         self._terminated = True
+        # Each creation cleans up its own sandbox when it sees ``_terminated``.
+        await asyncio.gather(*list(self._creating), return_exceptions=True)
         active, self._active = list(self._active), set()
         await asyncio.gather(*(sb.cleanup() for sb in active), return_exceptions=True)
 
