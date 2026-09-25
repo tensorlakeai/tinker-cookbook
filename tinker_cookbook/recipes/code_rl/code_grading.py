@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from tinker_cookbook.recipes.code_rl.lcb_utils import TEST_CODE, TEST_UTIL
 from tinker_cookbook.sandbox import SandboxBackend, SandboxFusionClient
 
+if TYPE_CHECKING:
+    from tinker_cookbook.sandbox.tensorlake_sandbox import TensorlakeSandboxPool
+
 # Global sandbox backend clients (lazily initialized)
 _sandboxfusion_client: SandboxFusionClient | None = None
 _modal_pool: Any = None  # ModalSandboxPool, but avoid import at module level
-_tensorlake_pool: Any = None  # TensorlakeSandboxPool, but avoid import at module level
+_tensorlake_pool: TensorlakeSandboxPool | None = None
 
 
 def _get_sandboxfusion_client() -> SandboxFusionClient:
@@ -43,7 +46,7 @@ def _get_modal_pool():
     return _modal_pool
 
 
-def _get_tensorlake_pool():
+def _get_tensorlake_pool() -> TensorlakeSandboxPool:
     """Get or create the Tensorlake sandbox pool."""
     global _tensorlake_pool
     if _tensorlake_pool is None:

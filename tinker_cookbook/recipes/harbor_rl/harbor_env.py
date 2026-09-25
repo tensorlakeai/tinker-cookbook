@@ -64,8 +64,9 @@ async def _get_tensorlake_image(env_dir: Path) -> str:
         )
         _tensorlake_image_builds[env_dir] = build
     try:
-        return await build
-    except BaseException:
+        # shield: a cancelled caller must not cancel the build that other rollouts share.
+        return await asyncio.shield(build)
+    except Exception:
         # Let the next call try the build again.
         if _tensorlake_image_builds.get(env_dir) is build:
             del _tensorlake_image_builds[env_dir]

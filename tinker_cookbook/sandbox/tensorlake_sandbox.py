@@ -29,7 +29,12 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 try:
-    from tensorlake.sandbox import AsyncSandbox, AsyncTcpTunnel, SandboxNotFoundError
+    from tensorlake.sandbox import (
+        AsyncSandbox,
+        AsyncSandboxClient,
+        AsyncTcpTunnel,
+        SandboxNotFoundError,
+    )
 except ImportError:
     raise ImportError(
         "tensorlake is required for TensorlakeSandbox. "
@@ -45,6 +50,7 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 _DEFAULT_MAX_OUTPUT_BYTES = 128 * 1024
+_UNCAPPED_BYTES = 2**40
 _TERMINATED_RE = re.compile(
     r"sandbox '[^']*' (not found|not running|terminated)|sandbox (has been )?terminated", re.I
 )
@@ -118,6 +124,7 @@ class TensorlakeSandbox:
         self._user = user
         self._max_stream_output_bytes = max_stream_output_bytes
         self._tunnels: dict[int, AsyncTcpTunnel] = {}
+        self._tunnel_lock = asyncio.Lock()
         self._cleaned_up = False
 
     @classmethod
@@ -159,6 +166,9 @@ class TensorlakeSandbox:
             snapshot_id=snapshot_id,
             allow_internet_access=allow_internet_access,
             allow_out=allow_out,
+            # The SDK's HTTP timeout (300 s by default) also bounds each
+            # command, so let it cover the sandbox lifetime.
+            request_timeout=timeout,
         )
         return cls(sandbox=sandbox, max_stream_output_bytes=max_stream_output_bytes, user=user)
 
@@ -217,12 +227,19 @@ class TensorlakeSandbox:
             )
         try:
             data = await asyncio.wait_for(self._sandbox.read_file(path), timeout=timeout)
+        except TimeoutError:
+            return SandboxResult(
+                stdout="", stderr=f"read_file timed out after {timeout}s", exit_code=-1
+            )
         except Exception as e:
             if _is_sandbox_terminated(e):
                 raise SandboxTerminatedError(str(e)) from e
             # The file API runs as the image's default user, which may not be
-            # able to read the file. Read it as ``self._user`` instead.
-            return await self.run_command(f"cat {shlex.quote(path)}", timeout=timeout)
+            # able to read the file. Read it as ``self._user`` instead. Like
+            # the file API, this path returns the whole file, so do not cap it.
+            return await self.run_command(
+                f"cat {shlex.quote(path)}", timeout=timeout, max_output_bytes=_UNCAPPED_BYTES
+            )
         content: bytes = data.value
         return SandboxResult(
             stdout=content.decode("utf-8", errors="replace"), stderr="", exit_code=0
@@ -291,10 +308,11 @@ class TensorlakeSandbox:
         The connection goes through an authenticated tunnel, so the port is not
         exposed to the internet. Tunnels are closed by ``cleanup``.
         """
-        tunnel = self._tunnels.get(port)
-        if tunnel is None or tunnel.closed:
-            tunnel = await self._sandbox.create_tunnel(port, local_port=0)
-            self._tunnels[port] = tunnel
+        async with self._tunnel_lock:
+            tunnel = self._tunnels.get(port)
+            if tunnel is None or tunnel.closed:
+                tunnel = await self._sandbox.create_tunnel(port, local_port=0)
+                self._tunnels[port] = tunnel
         return f"http://{tunnel.local_host}:{tunnel.local_port}"
 
     async def checkpoint(self, timeout: float = 300) -> str:
@@ -312,7 +330,6 @@ class TensorlakeSandbox:
         """Close tunnels and terminate the sandbox. Safe to call multiple times."""
         if self._cleaned_up:
             return
-        self._cleaned_up = True
         for tunnel in self._tunnels.values():
             with contextlib.suppress(Exception):
                 await tunnel.close()
@@ -322,6 +339,7 @@ class TensorlakeSandbox:
         except Exception as e:
             if not _is_sandbox_terminated(e):
                 raise
+        self._cleaned_up = True
 
 
 class TensorlakeSandboxPool:
@@ -363,6 +381,7 @@ class TensorlakeSandboxPool:
         self._image = image
         self._setup_command = setup_command
         self._snapshot_id: str | None = None
+        self._setup_error: SandboxError | None = None
         self._setup_lock = asyncio.Lock()
         self._active: set[TensorlakeSandbox] = set()
         # Creations and releases in progress. ``terminate`` waits for them, so
@@ -411,15 +430,19 @@ class TensorlakeSandboxPool:
         if self._setup_command is None:
             return None
         async with self._setup_lock:
+            # Fail fast after a setup failure, so each call does not run setup again.
+            if self._setup_error is not None:
+                raise self._setup_error
             if self._snapshot_id is None:
                 template = await self._create_sandbox()
                 try:
                     result = await template.run_command(self._setup_command, timeout=600)
                     self._check_terminated()
                     if result.exit_code != 0:
-                        raise SandboxError(
+                        self._setup_error = SandboxError(
                             f"Tensorlake pool setup failed ({result.exit_code}): {result.stderr}"
                         )
+                        raise self._setup_error
                     self._snapshot_id = await template.checkpoint()
                 finally:
                     await self._release(template)
@@ -445,7 +468,10 @@ class TensorlakeSandboxPool:
         async with self._semaphore:
             sandbox = await self._create_sandbox(snapshot_id)
             try:
-                workdir = f"/workspace/{uuid.uuid4().hex[:12]}"
+                # The file API runs as the image's default user, which may not
+                # be root. /tmp is writable for any user, so each upload works
+                # on the first try instead of the staged fallback in write_file.
+                workdir = f"/tmp/{uuid.uuid4().hex[:12]}"
                 if files:
                     results = await asyncio.gather(
                         *(
@@ -473,6 +499,13 @@ class TensorlakeSandboxPool:
         await asyncio.gather(*list(self._pending), return_exceptions=True)
         active, self._active = list(self._active), set()
         await asyncio.gather(*(sb.cleanup() for sb in active), return_exceptions=True)
+        snapshot_id, self._snapshot_id = self._snapshot_id, None
+        if snapshot_id is not None:
+            try:
+                async with AsyncSandboxClient(_internal=True) as client:
+                    await client.delete_snapshot(snapshot_id)
+            except Exception as e:
+                logger.warning(f"Failed to delete Tensorlake snapshot {snapshot_id}: {e}")
 
 
 def build_image_from_dockerfile(
@@ -484,9 +517,8 @@ def build_image_from_dockerfile(
     """Build a Tensorlake sandbox image from a Dockerfile and return its registered name.
 
     The image is cached by name. The default name comes from a hash of the
-    Dockerfile content and the context path, so a second call with the same
-    inputs does not rebuild. Pass ``rebuild=True`` after you change files in
-    the context directory.
+    Dockerfile and the files in the context directory, so a second call with
+    the same inputs does not rebuild.
 
     This call blocks while the image builds. In async code, run it with
     ``asyncio.to_thread``.
@@ -502,8 +534,10 @@ def build_image_from_dockerfile(
     dockerfile = Path(dockerfile_path).resolve()
     context = Path(context_dir).resolve() if context_dir is not None else dockerfile.parent
     if name is None:
-        digest = hashlib.sha256(dockerfile.read_bytes() + str(context).encode()).hexdigest()
-        name = f"tinker-{digest[:16]}"
+        h = hashlib.sha256(dockerfile.read_bytes())
+        for f in sorted(p for p in context.rglob("*") if p.is_file()):
+            h.update(str(f.relative_to(context)).encode() + b"\0" + f.read_bytes())
+        name = f"tinker-{h.hexdigest()[:16]}"
 
     if not rebuild and find_sandbox_image_by_name(name) is not None:
         return name

@@ -87,3 +87,37 @@ async def test_run_after_terminate_raises() -> None:
     await pool.terminate()
     with pytest.raises(SandboxError, match="terminated"):
         await pool.run_in_workdir({}, ["true"])
+
+
+@pytest.mark.asyncio
+async def test_terminate_deletes_setup_snapshot() -> None:
+    deleted: list[str] = []
+
+    class _FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "_FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        async def delete_snapshot(self, snapshot_id: str) -> None:
+            deleted.append(snapshot_id)
+
+    live: set[_FakeSandbox] = set()
+
+    async def fake_create(**kwargs: object) -> _FakeSandbox:
+        return _FakeSandbox(live)
+
+    with (
+        mock.patch.object(tensorlake_sandbox.TensorlakeSandbox, "create", fake_create),
+        mock.patch.object(tensorlake_sandbox, "AsyncSandboxClient", _FakeClient),
+    ):
+        pool = tensorlake_sandbox.TensorlakeSandboxPool(setup_command="pip install numpy")
+        await pool.run_in_workdir({"a.py": "x"}, ["python", "a.py"])
+        await pool.terminate()
+
+    assert deleted == ["snapshot"]
+    assert not live
