@@ -20,6 +20,7 @@ from tinker_cookbook.sandbox.sandboxfusion import SandboxFusionClient
 class SandboxBackend(StrEnum):
     SANDBOXFUSION = "sandboxfusion"
     MODAL = "modal"
+    TENSORLAKE = "tensorlake"
 
 
 __all__ = [

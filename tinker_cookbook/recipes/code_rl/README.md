@@ -48,6 +48,27 @@ Optional environment variables for Modal:
 - `MODAL_POOL_SIZE`: Number of concurrent sandboxes (default: 32)
 - `MODAL_CREATION_RATE_LIMIT`: Max sandboxes created per second (default: 4)
 
+#### Tensorlake (Alternative)
+
+[Tensorlake](https://docs.tensorlake.ai/sandboxes/introduction) provides cloud microVM sandboxes that start in under a second. To use Tensorlake:
+
+1. Install the tensorlake extra and set your API key:
+```bash
+uv pip install 'tinker-cookbook[tensorlake] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+export TENSORLAKE_API_KEY=...
+```
+
+2. Set the sandbox backend in your training command:
+```bash
+python -m tinker_cookbook.recipes.code_rl.train \
+    sandbox_backend=tensorlake \
+    ...
+```
+
+Optional environment variables for Tensorlake:
+
+- `TENSORLAKE_MAX_CONCURRENCY`: Max concurrent sandboxes (default: 32)
+
 ### Example command
 
 Train a `Qwen3.5-4B` model with thinking enabled:

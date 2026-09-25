@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import tomllib
 from collections.abc import Awaitable, Callable, Sequence
@@ -16,8 +17,7 @@ from tinker_cookbook.recipes.harbor_rl.harbor_tools import HarborBashTool, Harbo
 from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.renderers.base import Message, Renderer
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetBuilder
-from tinker_cookbook.sandbox import SandboxInterface
-from tinker_cookbook.sandbox.modal_sandbox import ModalSandbox
+from tinker_cookbook.sandbox import SandboxBackend, SandboxInterface
 from tinker_cookbook.tool_use import build_agent_tool_env
 from tinker_cookbook.tool_use.agent_tool_message_env import RewardFn
 
@@ -42,9 +42,58 @@ async def default_sandbox_factory(env_dir: Path, timeout: int) -> SandboxInterfa
     """
     import modal
 
+    from tinker_cookbook.sandbox.modal_sandbox import ModalSandbox
+
     dockerfile_path = env_dir / "Dockerfile"
     image = modal.Image.from_dockerfile(path=str(dockerfile_path), context_dir=str(env_dir))
     return await ModalSandbox.create(image=image, timeout=timeout)
+
+
+# Image builds keyed by environment directory, so concurrent rollouts of one
+# task share a single build.
+_tensorlake_image_builds: dict[Path, asyncio.Task[str]] = {}
+
+
+async def _get_tensorlake_image(env_dir: Path) -> str:
+    from tinker_cookbook.sandbox.tensorlake_sandbox import build_image_from_dockerfile
+
+    build = _tensorlake_image_builds.get(env_dir)
+    if build is None:
+        build = asyncio.create_task(
+            asyncio.to_thread(build_image_from_dockerfile, env_dir / "Dockerfile", env_dir)
+        )
+        _tensorlake_image_builds[env_dir] = build
+    try:
+        return await build
+    except BaseException:
+        # Let the next call try the build again.
+        if _tensorlake_image_builds.get(env_dir) is build:
+            del _tensorlake_image_builds[env_dir]
+        raise
+
+
+async def tensorlake_sandbox_factory(env_dir: Path, timeout: int) -> SandboxInterface:
+    """Create a Tensorlake sandbox from a task environment directory.
+
+    The image is built once per Dockerfile and cached by Tensorlake.
+
+    Args:
+        env_dir: Path to the task's environment/ directory (must contain a Dockerfile).
+        timeout: Sandbox lifetime in seconds.
+    """
+    from tinker_cookbook.sandbox.tensorlake_sandbox import TensorlakeSandbox
+
+    image = await _get_tensorlake_image(env_dir)
+    return await TensorlakeSandbox.create(image=image, timeout=timeout)
+
+
+def get_sandbox_factory(backend: SandboxBackend) -> SandboxFactory:
+    """Return the Harbor sandbox factory for a backend."""
+    if backend == SandboxBackend.MODAL:
+        return default_sandbox_factory
+    if backend == SandboxBackend.TENSORLAKE:
+        return tensorlake_sandbox_factory
+    raise ValueError(f"Harbor tasks do not support sandbox backend {backend!r}")
 
 
 @dataclass(frozen=True)
