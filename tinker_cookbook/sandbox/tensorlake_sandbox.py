@@ -24,7 +24,9 @@ import re
 import shlex
 import shutil
 import uuid
+from collections.abc import Coroutine
 from pathlib import Path
+from typing import Any, TypeVar
 
 try:
     from tensorlake.sandbox import AsyncSandbox, AsyncTcpTunnel, SandboxNotFoundError
@@ -39,6 +41,8 @@ from tinker_cookbook.exceptions import SandboxError
 from tinker_cookbook.sandbox.sandbox_interface import SandboxResult, SandboxTerminatedError
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 _DEFAULT_MAX_OUTPUT_BYTES = 128 * 1024
 _TERMINATED_RE = re.compile(
@@ -59,8 +63,9 @@ def _is_sandbox_terminated(e: BaseException) -> bool:
 # stdout/stderr inside the sandbox. Each stream goes through ``head -c N``, then
 # ``cat`` discards the rest so the program does not get SIGPIPE. ``stdbuf -o0``
 # stops ``head`` from buffering, so output before a timeout kill is kept.
-# $1 is the command and $2 is the cap. ``wait`` on process-substitution PIDs
-# needs bash 4.4+.
+# $1 is the command and $2 is the cap. The command does not inherit fds 5 and 6,
+# so a background process that redirects stdout/stderr does not keep the pipes
+# open. ``wait`` on process-substitution PIDs needs bash 4.4+.
 _CAPPED_RUN_SCRIPT = """\
 n=$2
 cap() {
@@ -69,7 +74,7 @@ cap() {
 }
 exec 5> >(cap); p1=$!
 exec 6> >(cap >&2); p2=$!
-bash -lc "$1" >&5 2>&6; rc=$?
+bash -lc "$1" >&5 2>&6 5>&- 6>&-; rc=$?
 exec 5>&- 6>&-
 wait "$p1" "$p2"
 exit "$rc"
@@ -203,6 +208,13 @@ class TensorlakeSandbox:
         self, path: str, max_bytes: int | None = None, timeout: int = 60
     ) -> SandboxResult:
         """Read a file from the sandbox."""
+        if max_bytes is not None:
+            # The file API downloads the full file, so read only the prefix in the sandbox.
+            return await self.run_command(
+                f"head -c {max_bytes} {shlex.quote(path)}",
+                timeout=timeout,
+                max_output_bytes=max_bytes,
+            )
         try:
             data = await asyncio.wait_for(self._sandbox.read_file(path), timeout=timeout)
         except Exception as e:
@@ -210,14 +222,8 @@ class TensorlakeSandbox:
                 raise SandboxTerminatedError(str(e)) from e
             # The file API runs as the image's default user, which may not be
             # able to read the file. Read it as ``self._user`` instead.
-            if max_bytes is not None:
-                cmd = f"head -c {max_bytes} {shlex.quote(path)}"
-            else:
-                cmd = f"cat {shlex.quote(path)}"
-            return await self.run_command(cmd, timeout=timeout)
+            return await self.run_command(f"cat {shlex.quote(path)}", timeout=timeout)
         content: bytes = data.value
-        if max_bytes is not None:
-            content = content[:max_bytes]
         return SandboxResult(
             stdout=content.decode("utf-8", errors="replace"), stderr="", exit_code=0
         )
@@ -359,40 +365,44 @@ class TensorlakeSandboxPool:
         self._snapshot_id: str | None = None
         self._setup_lock = asyncio.Lock()
         self._active: set[TensorlakeSandbox] = set()
-        self._creating: set[asyncio.Task[TensorlakeSandbox]] = set()
+        # Creations and releases in progress. ``terminate`` waits for them, so
+        # no sandbox is left running after it returns.
+        self._pending: set[asyncio.Future[Any]] = set()
         self._terminated = False
 
     def _check_terminated(self) -> None:
         if self._terminated:
             raise SandboxError("TensorlakeSandboxPool has been terminated.")
 
-    async def _create_sandbox(self, snapshot_id: str | None = None) -> TensorlakeSandbox:
-        """Create a sandbox and add it to ``_active``.
+    async def _track(self, coro: Coroutine[object, object, _T]) -> _T:
+        """Run *coro* as a task that ``terminate`` waits for."""
+        task = asyncio.ensure_future(coro)
+        self._pending.add(task)
+        try:
+            return await task
+        finally:
+            self._pending.discard(task)
 
-        ``terminate`` waits for creations in progress, so no sandbox is left
-        running after it returns.
-        """
+    async def _create_sandbox(self, snapshot_id: str | None = None) -> TensorlakeSandbox:
+        """Create a sandbox and add it to ``_active``."""
         self._check_terminated()
-        task = asyncio.ensure_future(
-            TensorlakeSandbox.create(
+
+        async def create() -> TensorlakeSandbox:
+            sandbox = await TensorlakeSandbox.create(
                 image=self._image, timeout=self._sandbox_timeout_secs, snapshot_id=snapshot_id
             )
-        )
-        self._creating.add(task)
-        try:
-            sandbox = await task
-        finally:
-            self._creating.discard(task)
-        if self._terminated:
-            await sandbox.cleanup()
-            self._check_terminated()
-        self._active.add(sandbox)
-        return sandbox
+            if self._terminated:
+                await sandbox.cleanup()
+                self._check_terminated()
+            self._active.add(sandbox)
+            return sandbox
+
+        return await self._track(create())
 
     async def _release(self, sandbox: TensorlakeSandbox) -> None:
         self._active.discard(sandbox)
         try:
-            await sandbox.cleanup()
+            await self._track(sandbox.cleanup())
         except Exception as e:
             logger.warning(f"Tensorlake sandbox cleanup failed: {e}")
 
@@ -460,7 +470,7 @@ class TensorlakeSandboxPool:
         """Stop accepting work and terminate all sandboxes, including ones being created."""
         self._terminated = True
         # Each creation cleans up its own sandbox when it sees ``_terminated``.
-        await asyncio.gather(*list(self._creating), return_exceptions=True)
+        await asyncio.gather(*list(self._pending), return_exceptions=True)
         active, self._active = list(self._active), set()
         await asyncio.gather(*(sb.cleanup() for sb in active), return_exceptions=True)
 
