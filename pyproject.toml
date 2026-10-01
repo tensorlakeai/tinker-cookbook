@@ -23,7 +23,7 @@ dependencies = [
     "safetensors>=0.4.0",
     "termcolor>=2.0.0",
     "tiktoken>=0.12.0", # Required for Kimi tokenizer
-    "tinker>=0.23.0",
+    "tinker>=0.30.1",
     "tml-renderers>=0.0.1",
     "torch>=2.10", # tml_renderers uses libtorch's stable C ABI, added in 2.10
     "tqdm>=4.60.0",
@@ -54,6 +54,9 @@ math-rl = [
 ]
 modal = [
     "modal>=1.5.1",
+]
+tensorlake = [
+    "tensorlake>=0.5.135",
 ]
 multiplayer-rl = [
     "textarena>=0.7.4",
@@ -135,6 +138,7 @@ all = [
     "tinker_cookbook[audio]",
     "tinker_cookbook[math-rl]",
     "tinker_cookbook[modal]",
+    "tinker_cookbook[tensorlake]",
     "tinker_cookbook[multiplayer-rl]",
     "tinker_cookbook[vector-search]",
     "tinker_cookbook[wandb]",
